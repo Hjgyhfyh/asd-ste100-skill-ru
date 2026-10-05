@@ -24,6 +24,8 @@
 рекомендательные.
 """
 import json
+import os
+import bisect
 import re
 import sys
 
@@ -70,10 +72,25 @@ _NOT_A_PARTICIPLE = (
 # оканчиваются так же, как «удалён», и в сочетании с творительным падежом
 # давали вывод «возможный страдательный залог» там, где его нет.
 _NOT_A_PASSIVE = (
+    # Оговорки и безличные конструкции. Оканчиваются так же, как причастие
+    # прошедшего времени, но причастиями не являются.
     r"причи[нануемой]*|возможн\w*|вероятн\w*|скорее|обычн\w*|вручн\w*|точно"
     r"|нужн\w*|важн\w*|обязат\w*|желат\w*|примерн\w*|наконец|конечн\w*"
     r"|случайн\w*|регулярн\w*|постоянн\w*|полностью|частично|отдельно"
-    r"|готов\w*|должен|способ"
+    r"|готов\w*|должен\w*|способ\w*"
+    # Связка с прилагательным: «был свободен» — это не страдательный залог.
+    # Подлежащее остаётся на месте, исполнителя нет, и называть его некого.
+    # Основы пишемся БЕЗ «н»: мужской род краткой формы — это «свобод»+«ен»,
+    # а не «свободн», поэтому «свободн\w*» не ловил «свободен» вовсе.
+    r"|свобод\w*|актив\w*|очевид\w*|замет\w*|стабил\w*|уверен\w*"
+    r"|доступ\w*|недоступ\w*|извест\w*|неизвест\w*|видим\w*|виден"
+    r"|цел|жив|прав|важен|важн|равен|равн|болен|сильн|слаб|молод|чист|пуст"
+    r"|прост|полн|слож\w*|ясен|ясн|точен|верен|долг|нужно|нельзя|можно"
+    # Безличные на -но: «трудно сказать», «видно, что», «непонятно, что».
+    r"|нетрудно|обидно|немного|странно|правильно|достаточно|реально|абсолютно"
+    r"|окончательно|исключительно|минимально|максимально|оптимально"
+    r"|формально|основном|жаль|пора|следует|труд\w*|невозмож\w*"
+    r"|маловероят\w*|непонят\w*|видно|нов|стар|готов\w*|способ\w*"
 )
 
 # Причастные основы. Окончания подобраны так, чтобы обычные прилагательные
@@ -94,19 +111,23 @@ PASSIVE_ANY = (r"(?:" + PARTICIPLE + r"|" + PASSIVE_SHORT + r")")
 # Окончания глагола для правила отглагольных существительных. Список явный,
 # а не `\w*`: иначе под правило попадали причастия («выполненных операций»)
 # и страдательные формы («проверка была выполнена»).
+#
+# Прошедших времён здесь НЕТ намеренно. «Выполнил проверку» и «Провёл
+# проверку» — уже глагольные обороты, действие не спрятано в существительном.
+# Правило должно требовать инфинитив, повелительное или настоящее время.
 VERB_ENDING = (r"(?:ться|сь|ся|ется|ится|яется|ается|уется|ть|сти"
-               r"|ет|ит|ёт|и|ем|им|ут|ют|ат|ят|ите|ете|ыте"
-               r"|л|ла|ло|ли|лась|лось|лись)")
+               r"|ет|ит|ёт|и|ем|им|ут|ют|ите|ете|ыте)")
 
 # Основы глаголов номинализации. Без чередований (провед|провел, осуществл|осуществ)
 # правило молчало на формах вроде «Провёл проверку» и «Осуществите проверку».
-VERB_STEM = (r"(?:осуществ|выполн|провед|провод|провел|провёл|провё|провес|произвед"
+VERB_STEM = (r"(?:осуществ|выполн|провед|провод|провес|произвед"
              r"|производ|сдела|настро|обработа|использу|окаж|оказ|реализу)")
 
-# Окончание необязательно: «Провел» целиком съедается основой. Пустой хвост не
-# ловит причастия, потому что дальше обязателен пробел и имя существительного —
-# «выполненных операций» обрывается на «енных» и не проходит.
-VERB_TAIL = r"(?:\w*" + VERB_ENDING + r")?"
+# Окончание обязательно: иначе основа съедает всё слово целиком, и прошедшее
+# время («Провёл проверку») начинает совпадать. Но «выполненных операций» и
+# «была выполнена» под правило не попадают: там хвост не совпадает с окончанием,
+# а дальше обязателен пробел с именем.
+VERB_TAIL = r"\w*" + VERB_ENDING
 
 RULES = [
     ("точка-с-запятой", "advisory-free",
@@ -141,16 +162,23 @@ RULES = [
                 r"|оценк|расчёт|расчет|помощ|поддержк|содействи|мер)\w*", re.I),
      "Действие заморожено в существительном. Верни глагол: «проверь», а не «выполни проверку»."),
     ("предложный-отглагольный", "advisory",
-     re.compile(r"\b(?:при|после|перед|для|во время|в ходе|в случае|в результате)"
+     # Предлоги, где оборот действительно стоит переписать в глагол.
+     # «после», «перед», «во время», «в случае», «в результате» дают
+     # естественные сочетания вроде «после проверки» или «перед
+     # использованием». Правило ругалось ровно на то, что само же
+     # называло обычным, поэтому эти предлоги убраны.
+     re.compile(r"\b(?:при|для|в ходе)"
                 r"\s+[а-яё]{3,}(?:ние|ния|нию|нием|ки|ке|ку|ках)\b", re.I),
      "Отглагольное существительное в предложном падеже: «при обработке». "
-     "Чаще всего это стоит переделать в глагол, но обороты «после проверки» и "
-     "«перед использованием» обычны для русского, поэтому правило рекомендательное."),
+     "Такие обороты прячут действие за существительным, и вернуть глагол "
+     "обычно читается яснее. Правило рекомендательное."),
     ("страдательный-залог", "advisory",
+     # Во второй ветке запятая запрещена внутри окна: иначе любая фраза
+     # вида «Видно, что нет связи с сервером» находит и «оговорку», и «агента».
      re.compile(r"\b(?:был|была|было|были|будет|будут|будет\s+быть|быть|может\s+быть|мог\s+быть"
                 r"|могут\s+быть|должен\s+быть|должна\s+быть|должно\s+быть|должны\s+быть)"
                 r"\s+" + PASSIVE_ANY + r"\b"
-                r"|\b" + PASSIVE_ANY + r"\b[^.;!?\n]{0,50}?\b"
+                r"|\b" + PASSIVE_ANY + r"\b[^.,;:!?\n]{0,40}?\b"
                 r"(?:агентом|инструментом|системой|пользователем|сервером|клиентом"
                 r"|ботом|скриптом|модулем|службой)\b", re.I),
      "Возможный страдательный залог. Назови исполнителя и поставь глагол в активный залог, "
@@ -160,25 +188,56 @@ RULES = [
      "Причастие прячет исполнителя и превращает действие в состояние. Верни глагол."),
 ]
 
-CODE_FENCE = re.compile(r"^(```|~~~)")
+CODE_FENCE = re.compile(r"^(?P<mark>`{3,}|~{3,})(?P<info>.*)$")
 INLINE_CODE = re.compile(r"`[^`]*`")
 LIST_ITEM_START = re.compile(
-    r"^(?P<indent> {0,3})(?P<marker>[-*+]|[0-9]+[.)])(?P<gap> +)(?P<body>.*)$"
+    r"^(?P<indent> *)(?P<marker>[-*+]|[0-9]+[.)])(?P<gap> +)(?P<body>.*)$"
 )
+# Всё, что не является текстом для проверки: адреса, комментарии, разметка.
+HTML_COMMENT = re.compile(r"<!--.*?-->", re.S)
+# Жирное и курсив. Сами звёзды убираются, а текст внутри остаётся: иначе
+# «правило о модальности.** Более ранняя» не разрывалось на два предложения,
+# и линтер считал их одним предложением на 21 слово.
+EMPHASIS_MARK = re.compile(r"(\*\*|__)(?=\S)(.+?)(?<=\S)\1")
+LINK_DESTINATION = re.compile(r"\]\([^)]*\)|<[^ >]*:[^ >]*>|\S+:\S+")
+# Отступ в четыре и более пробела — блок кода с отступом по CommonMark.
+INDENTED_CODE = re.compile(r"^(?: {4}|\t)\S")
 # Висячий союз в конце пункта списка.
 CONJUNCTION_END = re.compile(r"\b(?:и|или|а|но|же|бы)\s*$", re.I)
 # Сочинительные союзы для подсчёта связности предложения.
 COORDINATING = re.compile(r"\b(?:и|или|а|но)\b", re.I)
 MAX_COORDINATING = 3
 # Подчинительные союзы и относительные местоимения: русский эквивалент
-# цепочки англоязычных придаточных предложений. Два и больше в одном предложении —
-# признак того самого «спрятанного» условия.
+# цепочки англоязычных придаточных предложений. Два и больше в одном
+# предложении — признак «спрятанного» условия.
+#
+# Составные союзы считаются ОДНИМ придаточным: «несмотря на то что» — это
+# один союз, а не два. Считать их по частям означало бы ругаться на
+# совершенно обычную русскую конструкцию.
 SUBORDINATING = re.compile(
-    r"\b(?:котор(?:ый|ая|ое|ые|ых|ому|ой|ыми|ое)|что|чтобы|если|когда|пока"
-    r"|поскольку|так\s+как|того\s+как|в\s+том\s+случае|хотя|несмотря\s+на"
-    r"|в\s+случае|вследствие|ввиду|ежели)\b", re.I)
+    r"(?:котор(?:ый|ая|ое|ые|ых|ому|ой|ыми|ое)\b|чтобы\b"
+    r"|\b(?:что|если|когда|пока|поскольку|так\s+как|того\s+как|хотя|ежели)\b"
+    r"|\bв\s+том\s+случае\b|\bвследствие\s+того\s+что\b|\bнесмотря\s+на\s+то\s+что\b"
+    r"|\bв\s+случае\b|\bввиду\s+того\s+что\b|\bпо\s+мере\s+того\s+как\b)", re.I)
 MAX_SUBORDINATING = 2
 TABLE_SEPARATOR_CELL = re.compile(r"^:?-{3,}:?$")
+
+
+def strip_noise(line):
+    """Убрать то, что не является прозой: код, комментарии, адреса.
+
+    Всё заменяется пробелами той же длины, иначе номера колонок в находках
+    поедут и редактор подсветит не то место.
+    """
+    def blank(match):
+        return " " * len(match.group(0))
+
+    line = INLINE_CODE.sub(blank, line)
+    line = HTML_COMMENT.sub(blank, line)
+    # у выделения убираются только звёзды, текст внутри остаётся
+    line = EMPHASIS_MARK.sub(
+        lambda m: " " * (2 * len(m.group(1)) + len(m.group(2))), line)
+    return LINK_DESTINATION.sub(blank, line)
 
 
 def _stem_re(base):
@@ -262,19 +321,15 @@ def _markdown_table_cells(lines):
     return table_cells
 
 
-def _dangling_conjunction_findings(text, filename):
-    lines = text.splitlines()
+def _dangling_conjunction_findings(lines, filename):
+    # Строки приходят уже очищенными от кода и разметки, поэтому заборки
+    # здесь повторно искать не нужно.
     findings = []
-    in_fence = False
     index = 0
     while index < len(lines):
         line = lines[index]
         stripped = line.strip()
-        if CODE_FENCE.match(stripped):
-            in_fence = not in_fence
-            index += 1
-            continue
-        if in_fence:
+        if not stripped:
             index += 1
             continue
         start = LIST_ITEM_START.match(line)
@@ -341,6 +396,85 @@ def _dangling_conjunction_findings(text, filename):
             })
         index = next_index
     return findings
+
+
+def _mask_document(text):
+    """Разобрать документ один раз и вернуть список чистых строк.
+
+    На выходе список строк той же длины, что и вход. Строки кода, front
+    matter и HTML-комментарии заменены пустыми, с маркеров цитаты снят,
+    встроенный код, адреса и комментарии заменены пробесами той же длины.
+
+    Заборка кода учитывается по CommonMark: закрывает заборку только маркер
+    того же типа и не короче открывшего, и только если после него ничего
+    нет. Иначе находки попадали внутрь блока кода.
+    """
+    raw_lines = _split_lines(text)
+    out = []
+    fence = None
+    in_frontmatter = bool(raw_lines) and raw_lines[0].strip() == "---"
+    previous_was_list = False
+
+    for index, raw in enumerate(raw_lines):
+        stripped = raw.strip()
+
+        # Маркер цитаты снимается ПЕРВЫМ. Иначе заборка кода внутри цитаты
+        # («> ```») не распознаётся и её содержимое попадает в проверку.
+        body = raw
+        while True:
+            quote = re.match(r"^\s*(?:>\s?)+", body)
+            if not quote:
+                break
+            body = body[quote.end():]
+            body = " " * (len(raw) - len(body)) + body
+        stripped = body.strip()
+
+        if in_frontmatter:
+            # YAML-метаданные в начале файла — не проза
+            out.append("")
+            if index > 0 and stripped == "---":
+                in_frontmatter = False
+            continue
+
+        match = CODE_FENCE.match(stripped)
+        if fence is None and match:
+            fence = (match.group("mark")[0], len(match.group("mark")))
+            out.append("")
+            previous_was_list = False
+            continue
+        if fence is not None:
+            if (match and match.group("mark")[0] == fence[0]
+                    and len(match.group("mark")) >= fence[1]
+                    and not match.group("info").strip()):
+                fence = None
+            out.append("")
+            previous_was_list = False
+            continue
+
+        # Отступ в четыре пробела — блок кода, но только вне списка.
+        # Внутри пункта списка такой отступ означает продолжение пункта,
+        # и потерять его значит потерять весь текст пункта.
+        is_list_line = bool(LIST_ITEM_START.match(body))
+        if (INDENTED_CODE.match(body) and not previous_was_list
+                and not is_list_line):
+            out.append("")
+            previous_was_list = False
+            continue
+
+        out.append(strip_noise(body))
+        previous_was_list = is_list_line or (
+            previous_was_list and bool(stripped) and not stripped.startswith("#"))
+    return out
+
+
+def _split_lines(text):
+    """Разбить текст на строки только по настоящим переводам строк.
+
+    `str.splitlines()` считает разделителями ещё и невидимые символы
+    U+2028, U+2029, \\x0b, \\x0c, \\x85. Из-за этого номер строки в находке
+    не совпадал с тем, что показывает редактор.
+    """
+    return re.split(r"\r\n|\r|\n", text)
 
 
 def _prose_blocks(lines, table_cells):
@@ -433,11 +567,7 @@ def _sentence_findings(blocks, filename):
             cursor += len(sent) + 1
             if not stripped:
                 continue
-            lineno = block[0][0]
-            for index in range(len(starts) - 1, -1, -1):
-                if starts[index] <= begin:
-                    lineno = block[index][0]
-                    break
+            lineno = block[max(bisect.bisect_right(starts, begin) - 1, 0)][0]
             count = len(stripped.split())
             if count > MAX_WORDS:
                 findings.append({"file": filename, "line": lineno, "col": 1,
@@ -467,20 +597,16 @@ def _sentence_findings(blocks, filename):
 def lint(text, filename="<stdin>"):
     findings = []
     words_total = 0
-    in_fence = False
-    lines = text.splitlines()
+    # разбор документа делается один раз: код, front matter, комментарии и
+    # адреса убираются здесь, дальше все три прохода видят чистый текст
+    lines = _mask_document(text)
     table_cells = _markdown_table_cells(lines)
     # первое вхождение каждого члена группы синонимов: (индекс группы, основа) -> (строка, столбец, совпадение)
     seen_synonyms = {}
     for lineno, raw_line in enumerate(lines, 1):
-        if CODE_FENCE.match(raw_line.strip()):
-            in_fence = not in_fence
-            continue
-        if in_fence:
-            continue
         segments = table_cells.get(lineno - 1, [(raw_line, 0)])
         for segment, source_column in segments:
-            line = INLINE_CODE.sub("", segment)
+            line = segment
             words_total += len(line.split())
             for rule_id, level, pattern, msg in RULES:
                 for m in pattern.finditer(line):
@@ -511,10 +637,21 @@ def lint(text, filename="<stdin>"):
                                  "match": match,
                                  "message": (f"«{base}» и «{first_base}» называют одно действие. "
                                              "Выбери одно слово и используй его всегда.")})
-    findings.extend(_dangling_conjunction_findings(text, filename))
+    findings.extend(_dangling_conjunction_findings(lines, filename))
     findings.sort(key=lambda f: (f["line"], f["col"]))
     return findings, words_total
 
+
+def plural(count, one, few, many):
+    """Согласовать существительное с числом: 1 нарушение, 2 нарушения, 5 нарушений."""
+    tail, rest = count % 100, count % 10
+    if 11 <= tail <= 14:
+        return many
+    if rest == 1:
+        return one
+    if 2 <= rest <= 4:
+        return few
+    return many
 
 def report(findings, words_total, as_json, hard_count, baseline):
     rate = round(len(findings) * 100 / words_total, 1) if words_total else 0.0
@@ -526,8 +663,11 @@ def report(findings, words_total, as_json, hard_count, baseline):
         return
     for f in findings:
         print(f"{f['file']}:{f['line']}:{f['col']} {f['rule']}: {f['message']} [{f['match']}]")
-    print(f"\n{len(findings)} нарушений ({hard_count} жёстких, baseline {baseline}), "
-          f"{words_total} слов, {rate} на 100 слов")
+    print(f"{len(findings)} {plural(len(findings), 'нарушение', 'нарушения', 'нарушений')} "
+          f"({hard_count} {plural(hard_count, 'жёсткое', 'жёстких', 'жёстких')}, "
+          f"baseline {baseline}), "
+          f"{words_total} {plural(words_total, 'слово', 'слова', 'слов')}, "
+          f"{rate} на 100 слов")
     print("Оговорки и модальность («может», «возможно») не отмечаются никогда: "
           "уверенность — это содержание.")
 
@@ -699,6 +839,12 @@ def selftest():
             "Иногда причина в том, что соединение с сервером рвётся.",
             "Причина сбоя — слабый канал между клиентом и сервером.",
             "Обычно причина в том, что сервер перегружен.",
+            # «был недоступен» — связка с прилагательным, а не страдательный
+            # залог. Раньше оговорка перед таким словом давала ложную находку.
+            "Вероятно, причина в том, что сервер был недоступен во время проверки.",
+            "Сервер был недоступен во время проверки.",
+            "Файл был виден только после сборки.",
+            "Результат был известен заранее.",
     ):
         findings, _ = lint(text)
         assert findings == [], (text, findings)
@@ -707,7 +853,7 @@ def selftest():
     for text, rule in (
             ("Выполни проверку журнала.", "отглагольные-существительные"),
             ("Проведи проверку журнала.", "отглагольные-существительные"),
-            ("Провел проверку журнала.", "отглагольные-существительные"),
+            ("Осуществите проверку состояния.", "отглагольные-существительные"),
             ("Осуществите проверку состояния.", "отглагольные-существительные"),
             ("Окажите поддержку.", "отглагольные-существительные"),
             ("Проверка будет выполнена через час.", "страдательный-залог"),
@@ -730,21 +876,153 @@ def selftest():
     findings, _ = lint("Короткая строка.\nИ вторая короткая строка.")
     assert not any(f["rule"] == "длинное-предложение" for f in findings)
 
-    print("selftest OK")
+    # Регрессии по итогам независимой проверки 20 агентами.
+    #
+    # 1. Оговорки и безличные слова не должны выглядеть страдательным залогом.
+    for text in (
+            "Невозможно сказать, что всё в порядке с системой.",
+            "Видно, что нет связи с сервером.",
+            "Трудно сказать, что порядок с сервером.",
+            "Сложно сказать, что порядок с клиентом.",
+            "Непонятно, что делать с модулем.",
+            "Маловероятно, что есть связь с сервером.",
+            "Должно быть, всё в порядке с сервером.",
+            "Формально связь с сервером есть.",
+            "В основном связь с сервером есть.",
+            "Нельзя сказать, что порядок с системой.",
+            "Можно проверить, что порядок с системой.",
+    ):
+        findings, _ = lint(text)
+        assert findings == [], (text, findings)
+
+    # 2. Связка с прилагательным — не страдательный залог.
+    for text in (
+            "Порт был свободен до запуска.",
+            "Статус был активен долгое время.",
+            "Причина была очевидна сразу.",
+            "Ошибка была заметна в журнале.",
+            "Тест был стабилен на всех системах.",
+            "Должна была быть причина отказа.",
+    ):
+        findings, _ = lint(text)
+        assert findings == [], (text, findings)
+
+    # 3. Глагол в прошедшем времени — это уже глагол, а не номинализация.
+    for text in ("Провёл проверку журнала.", "Выполнил проверку.",
+                 "Осуществил проверку.", "Обработал операцию."):
+        findings, _ = lint(text)
+        assert findings == [], (text, findings)
+    # а настоящее и повелительное время по-прежнему ловится
+    for text in ("Выполни проверку журнала.", "Осуществите проверку состояния.",
+                 "Осуществляется настройка модуля."):
+        findings, _ = lint(text)
+        assert "отглагольные-существительные" in {f["rule"] for f in findings}, text
+
+    # 4. Код не проверяется ни в каком виде.
+    for text in (
+            "```\nплохой ; код\n```\nпосле ; кода",
+            "````\n```\nплохой ; код\n```\n````\nпосле ; кода",
+            "> ```\n> код ; тут\n> ```\nпосле ; кода",
+            "текст\n\n    код ; тут ; не проверять\n\nпосле ; кода",
+            "```python\nплохой ; код\n```\nпосле ; кода",
+    ):
+        findings, _ = lint(text)
+        hits = [f for f in findings if f["rule"] == "точка-с-запятой"]
+        assert len(hits) == 1, (text, hits)
+    # по CommonMark заборка с текстом после маркера не закрывает блок,
+    # поэтому весь остаток файла остаётся кодом
+    findings, _ = lint("```js\nплохой ; код\n``` хвост\nпосле ; кода")
+    assert findings == [], findings
+
+    # 5. Front matter и комментарии — не проза.
+    text = "---\nname: ste\ndescription: Описание; навыка\n---\n\nТекст без нарушений."
+    findings, _ = lint(text)
+    assert findings == [], findings
+    findings, _ = lint("<!-- ; внутри комментарий -->\nтекст без нарушений")
+    assert findings == [], findings
+
+    # 6. Адреса не проверяются.
+    for text in ("Открой [страницу](https://example.com/a;b=c) сейчас.",
+                 "Ссылка: <https://example.com/a;b=c>",
+                 "![схема](./img.png;a=1)"):
+        findings, _ = lint(text)
+        assert findings == [], (text, findings)
+
+    # 7. Номер строки считается по настоящим переводам строк.
+    text = "Первая; строка.\nВторая\u2028строка; тут.\nТретья; строка."
+    findings, _ = lint(text)
+    assert sorted(f["line"] for f in findings) == [1, 2, 3], findings
+
+    # 8. Колонка не должна уезжать из-за встроенного кода.
+    text = "Проверь `код` значение; тест."
+    findings, _ = lint(text)
+    semicolon = [f for f in findings if f["rule"] == "точка-с-запятой"]
+    assert semicolon and semicolon[0]["col"] == text.index(";") + 1, semicolon
+
+    # 9. Маркер цитаты не склеивает абзацы и не считается словом.
+    text = ("> Запись сделана сервером и сохранена в журнале\n"
+            "> без точки в конце\n>\n"
+            "> Дальше идёт проверка ответа и запись результата\n"
+            "> в отдельный файл без точки\n")
+    findings, words = lint(text)
+    assert not [f for f in findings if f["rule"] in ("длинное-предложение",
+                                                      "многосоюзность")], findings
+    assert words == 23, words  # 28 минус 5 маркеров «>», они не слова
+
+    # 10. Вложенный список с отступом 4 пробела.
+    findings, _ = lint("- Родительский пункт и\n    - Вложенный пункт или")
+    dangling = [f for f in findings if f["rule"] == "висячий-союз"]
+    assert [f["line"] for f in dangling] == [1, 2], dangling
+
+    # 11. Составной союз считается одним придаточным.
+    findings, _ = lint("Несмотря на то что дождь шёл, проверка прошла успешно.")
+    assert not [f for f in findings if f["rule"] == "сложные-подчинения"], findings
+
+    # 12. Многострочный блок не должен давать квадратичного времени.
+    import time as _time
+    huge = ("Проверь файл.\n" * 3000).rstrip("\n")
+    started = _time.perf_counter()
+    lint(huge)
+    assert _time.perf_counter() - started < 3.0, "многострочный блок слишком медленный"
+
+    print("самопроверка пройдена")
 
 
 class UserError(Exception):
     """Ошибка в аргументах командной строки."""
 
 
+USAGE = """Линтер упрощённого технического русского.
+
+Запуск:
+  ste-lint.py [файл ...]            проверяет файлы, без них читает стандартный ввод
+  ste-lint.py --json [файл ...]     структурированный вывод
+  ste-lint.py --baseline N         код 1 только если нарушений больше N
+  ste-lint.py --disable правило,... отключить правила по имени
+  ste-lint.py --selftest           проверить сам линтер
+  ste-lint.py -h, --help           эта справка
+
+Коды возврата:
+  0  жёстких нарушений не больше порога
+  1  жёстких нарушений больше порога
+  2  неверные аргументы или файл не прочитан
+
+Правила:"""
+
+
 def main(argv):
     if "--selftest" in argv:
         selftest()
+        return 0
+    if any(a in ("-h", "--help") for a in argv):
+        print(USAGE)
+        print("  " + ", ".join(all_rule_ids()))
         return 0
     as_json = "--json" in argv
     baseline = 0
     disabled = set()
     paths = []
+    stdin_requested = False
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -757,9 +1035,28 @@ def main(argv):
                     baseline = int(argv[i])
                 except ValueError:
                     raise UserError(f"--baseline ждёт целое число, получено {argv[i]!r}")
+                if baseline < 0:
+                    raise UserError("--baseline не может быть отрицательным")
             else:
-                disabled = {name.strip() for name in argv[i].split(",") if name.strip()}
-        elif not a.startswith("--"):
+                # повторный --disable дополняет предыдущий, а не затирает его
+                disabled |= {name.strip() for name in argv[i].split(",") if name.strip()}
+        elif a in ("--json",):
+            pass  # учтён выше, в as_json
+        elif a == "--":
+            # конец ключей, дальше только имена файлов
+            paths.extend(argv[i + 1:])
+            break
+        elif a == "-":
+            # одиночный дефис — общепринятое обозначение стандартного ввода.
+            # Проверять его надо ДО общей ветки для ключей, иначе дефис
+            # считается неизвестным ключом.
+            stdin_requested = True
+        elif a.startswith("-"):
+            # Раньше «-h» уходил в список файлов и давал невнятное
+            # «файл не найден». Теперь любой незнакомый ключ — понятная ошибка
+            # с подсказкой, а опечатка вроде «--jsonn» не остаётся незамеченной.
+            raise UserError(f"неизвестный ключ: {a}. Справка: --help")
+        else:
             paths.append(a)
         i += 1
 
@@ -771,28 +1068,60 @@ def main(argv):
         print(f"неизвестное правило: {', '.join(unknown)}", file=sys.stderr)
         print(f"доступные правила: {', '.join(all_rule_ids())}", file=sys.stderr)
         return 2
+    if paths and not disabled:
+        # повторный файл в списке удваивал и находки, и счётчик слов
+        seen_paths = set()
+        unique = []
+        for p in paths:
+            key = os.path.normcase(os.path.abspath(p))
+            if key not in seen_paths:
+                seen_paths.add(key)
+                unique.append(p)
+        paths = unique
 
     findings, words_total = [], 0
-    if paths:
+    failed = False
+    if paths and not stdin_requested:
         for p in paths:
+            if os.path.isdir(p):
+                print(f"это папка, а не файл: {p}", file=sys.stderr)
+                failed = True
+                continue
             try:
-                with open(p, encoding="utf-8") as handle:
+                # utf-8-sig снимает метку порядка байтов, если она есть,
+                # и при этом читает обычные файлы без метки
+                with open(p, encoding="utf-8-sig") as handle:
                     f, w = lint(handle.read(), filename=p)
             except FileNotFoundError:
                 print(f"файл не найден: {p}", file=sys.stderr)
-                return 2
-            except (IsADirectoryError, PermissionError):
-                # на Windows open() для папки даёт PermissionError,
-                # а не IsADirectoryError, поэтому ловим оба
-                print(f"это папка, а не файл: {p}", file=sys.stderr)
-                return 2
+                failed = True
+                continue
+            except PermissionError:
+                # файл занят другим процессом или нет прав на чтение.
+                # Раньше здесь печаталось «это папка», что сбивало с толку.
+                print(f"файл занят или нет прав на чтение: {p}", file=sys.stderr)
+                failed = True
+                continue
             except UnicodeDecodeError:
                 print(f"файл не в кодировке UTF-8: {p}", file=sys.stderr)
-                return 2
+                failed = True
+                continue
             findings.extend(f)
             words_total += w
     else:
-        findings, words_total = lint(sys.stdin.read())
+        try:
+            raw = sys.stdin.buffer.read().decode("utf-8-sig")
+        except UnicodeDecodeError:
+            # раньше здесь вылезала трассировка Python, а код возврата 1
+            # совпадал с «найдены нарушения» — конвейер принимал сломанный
+            # вход за успешную проверку
+            print("вход не в кодировке UTF-8", file=sys.stderr)
+            return 2
+        findings, words_total = lint(raw)
+    if failed:
+        # отчёт по остальным файлам всё равно полезен, но код 2 честнее
+        report(findings, words_total, as_json, 0, baseline)
+        return 2
 
     findings = [f for f in findings if f["rule"] not in disabled]
     hard_count = sum(1 for f in findings if f["level"] == "advisory-free")
@@ -806,3 +1135,13 @@ if __name__ == "__main__":
     except UserError as error:
         print(f"ошибка: {error}", file=sys.stderr)
         sys.exit(2)
+    except BrokenPipeError:
+        # при "| head" вывод закрывается на середине печати. Трассировка
+        # Python здесь была бы шумом, а не диагностикой.
+        try:
+            sys.stdout.close()
+        except BrokenPipeError:
+            pass
+        sys.exit(0)
+    except KeyboardInterrupt:
+        sys.exit(130)
